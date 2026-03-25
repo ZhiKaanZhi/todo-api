@@ -1,13 +1,56 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
+	"fmt"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
-func TestHandleGetTodos(t *testing.T) {
+// Mock store — implements TodoStorer without a database.
+type MockStore struct {
+	todos  map[int]Todo
+	nextID int
+}
 
+func NewMockStore(todos map[int]Todo) *MockStore {
+	return &MockStore{
+		todos:  todos,
+		nextID: len(todos) + 1,
+	}
+}
+
+func (m *MockStore) GetAll(ctx context.Context) ([]Todo, error) {
+	result := make([]Todo, 0, len(m.todos))
+	for _, t := range m.todos {
+		result = append(result, t)
+	}
+	return result, nil
+}
+
+func (m *MockStore) Create(ctx context.Context, t *Todo) error {
+	t.ID = m.nextID
+	t.CreatedAt = time.Now()
+	t.ExpiresAt = time.Now().Add(72 * time.Hour)
+	m.todos[m.nextID] = *t
+	m.nextID++
+	return nil
+}
+
+func (m *MockStore) Delete(ctx context.Context, id int) error {
+	if _, exists := m.todos[id]; !exists {
+		return fmt.Errorf("todo not found")
+	}
+	delete(m.todos, id)
+	return nil
+}
+
+// Tests
+
+func TestHandleGetTodos(t *testing.T) {
 	tests := []struct {
 		name           string
 		setupTodos     map[int]Todo
@@ -33,64 +76,73 @@ func TestHandleGetTodos(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// 1. Set up: put test data in the global todos map
-			todos = tt.setupTodos
+			srv := &Server{store: NewMockStore(tt.setupTodos)}
 
-			// 2. Create a fake request with httptest
 			req := httptest.NewRequest("GET", "/todos", nil)
 			rec := httptest.NewRecorder()
-			// 3. Call the handler
-			handleGetTodos(rec, req)
-			// 4. Check the status code and response body
+
+			srv.handleGetTodos(rec, req)
+
 			if rec.Code != tt.expectedStatus {
 				t.Errorf("status: got %d, want %d", rec.Code, tt.expectedStatus)
+			}
+
+			var got []Todo
+			json.NewDecoder(rec.Body).Decode(&got)
+			if len(got) != tt.expectedCount {
+				t.Errorf("count: got %d, want %d", len(got), tt.expectedCount)
 			}
 		})
 	}
 }
 
-func TestHandleCreateTodos(t *testing.T) {
+func TestHandleCreateTodo(t *testing.T) {
 	tests := []struct {
 		name           string
 		body           string
-		setupTodos     map[int]Todo
 		expectedStatus int
 	}{
 		{
 			name:           "create new todo",
 			body:           `{"title":"Test","description":"A test todo"}`,
-			setupTodos:     map[int]Todo{},
 			expectedStatus: 201,
 		},
 		{
 			name:           "garbage body",
 			body:           `this is not json`,
-			setupTodos:     map[int]Todo{},
 			expectedStatus: 400,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// 1. Set up: put test data in the global todos map
-			todos = tt.setupTodos
-			nextID = 1
+			srv := &Server{store: NewMockStore(map[int]Todo{})}
 
-			// 2. Create a fake request with httptest
 			body := strings.NewReader(tt.body)
 			req := httptest.NewRequest("POST", "/todos", body)
 			rec := httptest.NewRecorder()
-			// 3. Call the handler
-			handleCreateTodo(rec, req)
-			// 4. Check the status code and response body
+
+			srv.handleCreateTodo(rec, req)
+
 			if rec.Code != tt.expectedStatus {
 				t.Errorf("status: got %d, want %d", rec.Code, tt.expectedStatus)
+			}
+
+			if tt.expectedStatus == 201 {
+				var got Todo
+				json.NewDecoder(rec.Body).Decode(&got)
+				if got.ID == 0 {
+					t.Error("expected todo to have an ID assigned")
+				}
+				if got.Title != "Test" {
+					t.Errorf("title: got %q, want %q", got.Title, "Test")
+				}
 			}
 		})
 	}
 }
 
-func TestHandleDeleteTodos(t *testing.T) {
+func TestHandleDeleteTodo(t *testing.T) {
 	tests := []struct {
 		name           string
 		id             string
@@ -98,8 +150,8 @@ func TestHandleDeleteTodos(t *testing.T) {
 		expectedStatus int
 	}{
 		{
-			name: "delete todo",
-			id:   `1`,
+			name: "delete existing todo",
+			id:   "1",
 			setupTodos: map[int]Todo{
 				1: {ID: 1, Title: "First"},
 				2: {ID: 2, Title: "Second"},
@@ -108,13 +160,13 @@ func TestHandleDeleteTodos(t *testing.T) {
 		},
 		{
 			name:           "garbage id",
-			id:             `garbage`,
+			id:             "garbage",
 			setupTodos:     map[int]Todo{},
 			expectedStatus: 400,
 		},
 		{
 			name:           "unknown id",
-			id:             `3`,
+			id:             "3",
 			setupTodos:     map[int]Todo{},
 			expectedStatus: 404,
 		},
@@ -122,16 +174,14 @@ func TestHandleDeleteTodos(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// 1. Set up: put test data in the global todos map
-			todos = tt.setupTodos
+			srv := &Server{store: NewMockStore(tt.setupTodos)}
 
-			// 2. Create a fake request with httptest
 			req := httptest.NewRequest("DELETE", "/todos/"+tt.id, nil)
 			req.SetPathValue("id", tt.id)
 			rec := httptest.NewRecorder()
-			// 3. Call the handler
-			handleDeleteTodo(rec, req)
-			// 4. Check the status code and response body
+
+			srv.handleDeleteTodo(rec, req)
+
 			if rec.Code != tt.expectedStatus {
 				t.Errorf("status: got %d, want %d", rec.Code, tt.expectedStatus)
 			}
