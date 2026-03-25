@@ -7,7 +7,10 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
@@ -87,9 +90,30 @@ func (s *Server) handleDeleteTodo(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func main() {
-	ctx := context.Background()
+func startCleanupWorker(ctx context.Context, pool *pgxpool.Pool, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
 
+	for {
+		select {
+		case <-ticker.C:
+			result, err := pool.Exec(ctx,
+				"DELETE FROM todos WHERE expires_at < NOW()")
+			if err != nil {
+				log.Printf("Cleanup error: %v", err)
+				continue
+			}
+			if result.RowsAffected() > 0 {
+				log.Printf("Cleaned up %d expired todos", result.RowsAffected())
+			}
+		case <-ctx.Done():
+			log.Println("Cleanup worker stopping")
+			return
+		}
+	}
+}
+
+func main() {
 	if err := godotenv.Load(); err != nil {
 		log.Println("No .env file found, using environment variables")
 	}
@@ -100,22 +124,54 @@ func main() {
 		os.Getenv("POSTGRES_DB"),
 	)
 
-	// 1. Create the database connection pool
+	// 1. Create a context that cancels on Ctrl+C or container stop
+	ctx, cancel := signal.NotifyContext(context.Background(),
+		syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+
+	// 2. Create the database connection pool
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
 		log.Fatalf("Unable to connect to database: %v", err)
 	}
 	defer pool.Close()
 
-	// 2. Build the store and server
+	// 3. Build the store and server
 	store := &TodoStore{pool: pool}
 	srv := &Server{store: store}
 
-	// 3. Register routes
+	// 4. Start the cleanup worker (runs in background)
+	go startCleanupWorker(ctx, pool, 1*time.Minute)
+
+	// 5. Configure HTTP server
 	http.HandleFunc("GET /todos", srv.handleGetTodos)
 	http.HandleFunc("POST /todos", srv.handleCreateTodo)
 	http.HandleFunc("DELETE /todos/{id}", srv.handleDeleteTodo)
 
-	fmt.Println("TODO API starting on :8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	httpServer := &http.Server{
+		Addr: ":8080",
+	}
+
+	// 6. Start HTTP server in a goroutine
+	go func() {
+		fmt.Println("TODO API starting on :8080")
+		if err := httpServer.ListenAndServe(); err != http.ErrServerClosed {
+			log.Fatalf("HTTP server error: %v", err)
+		}
+	}()
+
+	// 7. Wait for shutdown signal
+	<-ctx.Done()
+	log.Println("Shutdown signal received")
+
+	// 8. Drain in-flight requests (5 second timeout)
+	shutdownCtx, shutdownCancel := context.WithTimeout(
+		context.Background(), 5*time.Second)
+	defer shutdownCancel()
+
+	if err := httpServer.Shutdown(shutdownCtx); err != nil {
+		log.Printf("HTTP shutdown error: %v", err)
+	}
+
+	log.Println("Server stopped")
 }
